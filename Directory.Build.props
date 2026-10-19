@@ -1,0 +1,13 @@
+<Project>
+
+  <!-- The FluentGpu app baseline (TFM, GC posture, analyzer switches, engine references, AOT publish defaults) comes
+       from the engine's FluentGpu.App.props. feat/overlay-window lives in the lane-a worktree until it merges;
+       override with a git-ignored EngineRoot.local.props or -p:EngineRoot. -->
+  <Import Project="$(MSBuildThisFileDirectory)EngineRoot.local.props" Condition="'$(EngineRoot)' == '' and Exists('$(MSBuildThisFileDirectory)EngineRoot.local.props')" />
+  <PropertyGroup>
+    <EngineRoot Condition="'$(EngineRoot)' == ''">$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\lane-a\fluent-gpu'))</EngineRoot>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <Import Project="$(EngineRoot)FluentGpu.App.props" />
+
+</Project>

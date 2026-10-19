@@ -1,13 +1,19 @@
 <Project>
 
   <!-- The FluentGpu app baseline (TFM, GC posture, analyzer switches, engine references, AOT publish defaults) comes
-       from the engine's FluentGpu.App.props. feat/overlay-window lives in the lane-a worktree until it merges;
-       override with a git-ignored EngineRoot.local.props or -p:EngineRoot. -->
+       from the engine's FluentGpu.App.props (christosk92/fluent-gpu, main since #58). The default is the engine checkout
+       at ..\fgpu\fluent-gpu; pin another one in a git-ignored EngineRoot.local.props or with -p:EngineRoot. -->
   <Import Project="$(MSBuildThisFileDirectory)EngineRoot.local.props" Condition="'$(EngineRoot)' == '' and Exists('$(MSBuildThisFileDirectory)EngineRoot.local.props')" />
   <PropertyGroup>
-    <EngineRoot Condition="'$(EngineRoot)' == ''">$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\lane-a\fluent-gpu'))</EngineRoot>
+    <EngineRoot Condition="'$(EngineRoot)' == ''">..\fgpu\fluent-gpu</EngineRoot>
+    <EngineRoot>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '$(EngineRoot)'))</EngineRoot>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
-  <Import Project="$(EngineRoot)FluentGpu.App.props" />
+  <Import Project="$(EngineRoot)FluentGpu.App.props" Condition="Exists('$(EngineRoot)FluentGpu.App.props')" />
+
+  <Target Name="RequireFluentGpuEngine" BeforeTargets="BeforeBuild;Restore;CollectPackageReferences"
+          Condition="!Exists('$(EngineRoot)FluentGpu.App.props')">
+    <Error Text="FluentGpu engine not found at '$(EngineRoot)' (no FluentGpu.App.props). Clone https://github.com/christosk92/fluent-gpu (main) and set EngineRoot in EngineRoot.local.props or with -p:EngineRoot=..." />
+  </Target>
 
 </Project>

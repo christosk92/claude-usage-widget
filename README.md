@@ -14,9 +14,9 @@ every account you run through a `CLAUDE_CONFIG_DIR` alias, built on the FluentGp
 
 ## Build
 
-Needs the .NET 10 SDK and a FluentGpu engine checkout. `Directory.Build.props` points `EngineRoot` at
-`..\lane-a\fluent-gpu` (the `feat/overlay-window` branch, christosk92/fluent-gpu#58); override it in a git-ignored
-`EngineRoot.local.props`:
+Needs the .NET 10 SDK and a checkout of [fluent-gpu](https://github.com/christosk92/fluent-gpu) `main` (the overlay
+APIs landed in christosk92/fluent-gpu#58). `Directory.Build.props` looks for it at `..\fgpu\fluent-gpu`; point it
+elsewhere with a git-ignored `EngineRoot.local.props` next to the csproj:
 
 ```xml
 <Project><PropertyGroup><EngineRoot>C:\wavee\fgpu\fluent-gpu\</EngineRoot></PropertyGroup></Project>

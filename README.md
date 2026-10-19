@@ -1,4 +1,5 @@
 # Claude usage widget
+<img width="529" height="500" alt="image" src="https://github.com/user-attachments/assets/14cf054c-49f0-4811-bf4f-c8743d5701ca" />
 
 A small always-on-top Windows overlay that shows the Claude Code usage limits (5-hour session and weekly windows) of
 every account you run through a `CLAUDE_CONFIG_DIR` alias, built on the FluentGpu engine.

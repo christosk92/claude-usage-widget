@@ -24,14 +24,23 @@ public sealed record Account(string Name, string ConfigDir, bool HasAlias)
 /// <summary>One rate-limit window: utilization 0..100 and when it resets.</summary>
 public sealed record LimitWindow(double Percent, DateTimeOffset? ResetsAt);
 
+/// <summary>A weekly limit scoped to one model (Fable, …) on top of the all-models week, named by the model's display name.
+/// <see cref="Window"/> is its use of its own allowance; <see cref="OfWeek"/> the same use as percent of the whole week and
+/// <see cref="AllowanceOfWeek"/> how much of the week the model may take (50 for Fable), when the endpoint says.</summary>
+public sealed record ModelLimit(string Name, LimitWindow Window, double? OfWeek = null, double? AllowanceOfWeek = null);
+
 /// <summary>What the widget shows for one account. <see cref="Error"/> set ⇒ the windows may be the last good values;
 /// <see cref="Failure"/> is the logged failure behind it (null for "Loading…" / "Not signed in"). <see cref="Source"/> says
-/// where the numbers came from: "api" (this fetch), "cli" (Claude Code's own cache) or "saved" (the widget's last run).</summary>
+/// where the numbers came from: "api" (this fetch), "cli" (Claude Code's own cache) or "saved" (the widget's last run).
+/// <see cref="Session"/> stays null on an account without a 5h window (the endpoint no longer lists one for it).</summary>
 public sealed record AccountUsage(string Name, string Plan, LimitWindow? Session, LimitWindow? Weekly, string? Error,
-    DateTimeOffset FetchedAt, ErrorEntry? Failure = null, string Source = "api")
+    DateTimeOffset FetchedAt, ErrorEntry? Failure = null, string Source = "api", IReadOnlyList<ModelLimit>? Models = null)
 {
-    /// <summary>Headroom for the "best pick": the tighter of the two windows, as percent left.</summary>
-    public double Headroom => Error is not null && Session is null ? -1
+    public bool HasData => Session is not null || Weekly is not null;
+
+    /// <summary>Headroom for the "best pick": the tighter of the session and all-models windows, as percent left. Model
+    /// limits don't count: a model at its cap leaves the others usable.</summary>
+    public double Headroom => !HasData ? -1
         : 100 - Math.Max(Session?.Percent ?? 0, Weekly?.Percent ?? 0);
 }
 
@@ -347,18 +356,20 @@ public sealed class UsageClient : IDisposable
 
     async Task<AccountUsage> FetchAsync(Account account, CancellationToken ct)
     {
-        string plan = "";
         // An alias that hasn't signed in yet: nothing to fetch, and no backoff to sit out once it has.
-        if (!account.SignedIn) return new AccountUsage(account.Name, plan, null, null, "Not signed in", DateTimeOffset.Now);
+        if (!account.SignedIn) return new AccountUsage(account.Name, "", null, null, "Not signed in", DateTimeOffset.Now);
+        var cli = ReadCli(account);
+        string plan = cli.Plan ?? "";
         try
         {
             JsonNode creds = ReadCreds(account);
-            plan = (string?)creds["claudeAiOauth"]?["subscriptionType"] ?? "";
+            // The credentials' subscriptionType is from sign-in and keeps the old names ("max" on an Ultra plan).
+            if (plan.Length == 0) plan = (string?)creds["claudeAiOauth"]?["subscriptionType"] ?? "";
             // Fresh enough (ours, or the CLI's own fetch): don't spend the account's tight usage quota.
-            if (Known(account, plan) is { } known && DateTimeOffset.Now - known.FetchedAt < FreshFor)
-                return known with { Error = null, Failure = null };
+            if (Known(account, cli.Usage) is { } known && DateTimeOffset.Now - known.FetchedAt < FreshFor)
+                return known with { Plan = plan, Error = null, Failure = null };
             if (_backoff.TryGetValue(account.Name, out var b) && b.Until > DateTimeOffset.UtcNow)
-                return Stale(account, plan, $"{b.Cause?.Summary ?? "Failed"} · retry in {Countdown.Format(b.Until - DateTimeOffset.UtcNow)}", b.Cause);
+                return Stale(account, cli.Usage, plan, $"{b.Cause?.Summary ?? "Failed"} · retry in {Countdown.Format(b.Until - DateTimeOffset.UtcNow)}", b.Cause);
 
             if (IsExpired(creds)) creds = await RefreshAsync(account, ct).ConfigureAwait(false);
             using var resp = await GetUsageAsync(account, creds, ct).ConfigureAwait(false);
@@ -374,8 +385,7 @@ public sealed class UsageClient : IDisposable
             {
                 if (!final.IsSuccessStatusCode) throw await ApiException.FromAsync("GET", UsageUrl, final, ct).ConfigureAwait(false);
                 using var doc = JsonDocument.Parse(await final.Content.ReadAsStreamAsync(ct).ConfigureAwait(false));
-                var usage = new AccountUsage(account.Name, plan, Window(doc.RootElement, "five_hour"),
-                    Window(doc.RootElement, "seven_day"), null, DateTimeOffset.Now);
+                var usage = FromUtilization(account.Name, plan, doc.RootElement, DateTimeOffset.Now, "api");
                 _backoff.Remove(account.Name);
                 _last[account.Name] = usage;
                 Save();
@@ -387,39 +397,46 @@ public sealed class UsageClient : IDisposable
         {
             string summary = Describe(ex);
             var cause = BackOff(account, ex, summary);
-            return Stale(account, plan, summary, cause);
+            return Stale(account, cli.Usage, plan, summary, cause);
         }
     }
 
-    AccountUsage Stale(Account account, string plan, string error, ErrorEntry? cause)
-        => Known(account, plan) is { } last
-            ? last with { Error = error, Failure = cause }
+    AccountUsage Stale(Account account, AccountUsage? cli, string plan, string error, ErrorEntry? cause)
+        => Known(account, cli) is { } last
+            ? last with { Plan = plan, Error = error, Failure = cause }
             : new AccountUsage(account.Name, plan, null, null, error, DateTimeOffset.Now, cause);
 
     /// <summary>The newest numbers known for the account without a request: the widget's own last result (this run or
     /// saved by the last one) or Claude Code's cached fetch, whichever is younger.</summary>
-    AccountUsage? Known(Account account, string plan)
+    AccountUsage? Known(Account account, AccountUsage? cli)
     {
         _last.TryGetValue(account.Name, out var ours);
-        var cli = CliCache(account, plan);
         return ours is null ? cli : cli is null || ours.FetchedAt >= cli.FetchedAt ? ours : cli;
     }
 
-    /// <summary>Claude Code's <c>cachedUsageUtilization</c> in <c>&lt;config&gt;/.claude.json</c>: the same usage response,
-    /// stamped with when the CLI fetched it. Null when absent, unreadable or mid-write.</summary>
-    static AccountUsage? CliCache(Account account, string plan)
+    /// <summary>
+    /// Claude Code's own state in <c>&lt;config&gt;/.claude.json</c>: the plan from its cached profile
+    /// (<c>oauthAccount.planDisplayName</c>, e.g. "Ultra", else the organization type) and <c>cachedUsageUtilization</c>,
+    /// the same usage response stamped with when the CLI fetched it. Nulls when absent, unreadable or mid-write.
+    /// </summary>
+    static (string? Plan, AccountUsage? Usage) ReadCli(Account account)
     {
         try
         {
             using var stream = new FileStream(Path.Combine(account.ConfigDir, ".claude.json"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var doc = JsonDocument.Parse(stream);
-            if (!doc.RootElement.TryGetProperty("cachedUsageUtilization", out var c) || c.ValueKind != JsonValueKind.Object
-                || !c.TryGetProperty("utilization", out var u) || !c.TryGetProperty("fetchedAtMs", out var at) || !at.TryGetInt64(out long ms))
-                return null;
-            return new AccountUsage(account.Name, plan, Window(u, "five_hour"), Window(u, "seven_day"), null,
-                DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime(), Source: "cli");
+            var root = doc.RootElement;
+            string? plan = root.TryGetProperty("oauthAccount", out var oa) && oa.ValueKind == JsonValueKind.Object
+                ? Str(oa, "planDisplayName") ?? Str(oa, "organizationType")?.Replace("claude_", "")
+                : null;
+            AccountUsage? usage = null;
+            if (root.TryGetProperty("cachedUsageUtilization", out var c) && c.ValueKind == JsonValueKind.Object
+                && c.TryGetProperty("utilization", out var u) && u.ValueKind == JsonValueKind.Object
+                && c.TryGetProperty("fetchedAtMs", out var at) && at.TryGetInt64(out long ms))
+                usage = FromUtilization(account.Name, plan ?? "", u, DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime(), "cli");
+            return (plan, usage);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return (null, null); }
     }
 
     /// <summary>
@@ -436,8 +453,8 @@ public sealed class UsageClient : IDisposable
             {
                 ["plan"] = u.Plan,
                 ["fetchedAtMs"] = u.FetchedAt.ToUnixTimeMilliseconds(),
-                ["five_hour"] = WindowJson(u.Session),
-                ["seven_day"] = WindowJson(u.Weekly),
+                ["limits"] = LimitsJson(u),
+                ["weekly_scoped_shares"] = SharesJson(u),
             };
         }
         foreach (var (name, b) in _backoff)
@@ -457,11 +474,41 @@ public sealed class UsageClient : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
-    static JsonNode? WindowJson(LimitWindow? w) => w is null ? null : new JsonObject
+    /// <summary>The account's windows in the endpoint's own <c>limits</c> shape, so the saved copy parses like a response.</summary>
+    static JsonArray LimitsJson(AccountUsage u)
     {
-        ["utilization"] = w.Percent,
-        ["resets_at"] = w.ResetsAt?.ToString("O"),
-    };
+        var limits = new JsonArray();
+        if (u.Session is { } s) limits.Add(Limit("session", s, null));
+        if (u.Weekly is { } w) limits.Add(Limit("weekly_all", w, null));
+        foreach (var m in u.Models ?? []) limits.Add(Limit("weekly_scoped", m.Window, m.Name));
+        return limits;
+
+        // JsonNode, not JsonObject: JsonArray.Add(JsonObject) binds the generic Add<T>, which isn't trim / AOT safe.
+        static JsonNode Limit(string kind, LimitWindow w, string? model) => new JsonObject
+        {
+            ["kind"] = kind,
+            ["percent"] = w.Percent,
+            ["resets_at"] = w.ResetsAt?.ToString("O"),
+            ["scope"] = model is null ? null : new JsonObject { ["model"] = new JsonObject { ["display_name"] = model } },
+        };
+    }
+
+    /// <summary>The model limits' week shares, indexed into <see cref="LimitsJson"/>'s list (models follow session / week).</summary>
+    static JsonArray SharesJson(AccountUsage u)
+    {
+        var shares = new JsonArray();
+        int first = (u.Session is null ? 0 : 1) + (u.Weekly is null ? 0 : 1);
+        var models = u.Models ?? [];
+        for (int i = 0; i < models.Count; i++)
+            if (models[i].OfWeek is { } of)
+                shares.Add((JsonNode)new JsonObject
+                {
+                    ["limit_index"] = first + i,
+                    ["used_percent_of_weekly"] = of,
+                    ["allowance_percent_of_weekly"] = models[i].AllowanceOfWeek,
+                });
+        return shares;
+    }
 
     void LoadSaved()
     {
@@ -472,9 +519,7 @@ public sealed class UsageClient : IDisposable
             {
                 var v = p.Value;
                 if (v.TryGetProperty("fetchedAtMs", out var at) && at.TryGetInt64(out long ms))
-                    _last[p.Name] = new AccountUsage(p.Name, v.TryGetProperty("plan", out var plan) ? plan.GetString() ?? "" : "",
-                        Window(v, "five_hour"), Window(v, "seven_day"), null,
-                        DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime(), Source: "saved");
+                    _last[p.Name] = FromUtilization(p.Name, Str(v, "plan") ?? "", v, DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime(), "saved");
                 if (v.TryGetProperty("retryAtMs", out var r) && r.TryGetInt64(out long retryMs)
                     && DateTimeOffset.FromUnixTimeMilliseconds(retryMs) is var until && until > DateTimeOffset.UtcNow)
                 {
@@ -492,10 +537,11 @@ public sealed class UsageClient : IDisposable
     ErrorEntry BackOff(Account account, Exception ex, string summary)
     {
         int failures = _backoff.TryGetValue(account.Name, out var b) ? b.Failures + 1 : 1;
-        // 429 and network errors: 1, 2, 4 … 30 min. Not a polling storm against an endpoint that already said slow down.
-        var delay = TimeSpan.FromMinutes(Math.Min(30, Math.Pow(2, failures - 1)));
-        if (ex is HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests } && delay < TimeSpan.FromMinutes(2))
-            delay = TimeSpan.FromMinutes(2);
+        // Network and other errors: 1, 2, 4 … 30 min. 429: 5, 10, 20, 40, 60 min — an account whose limit is held by its
+        // own CLI sessions stays limited under retries every few minutes, and Retry-After (always 0 here) doesn't help.
+        var delay = ex is HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests }
+            ? TimeSpan.FromMinutes(Math.Min(60, 5 * Math.Pow(2, failures - 1)))
+            : TimeSpan.FromMinutes(Math.Min(30, Math.Pow(2, failures - 1)));
         if (ex is ApiException { RetryAfter: { } after } && after > delay) delay = after;
         var cause = ErrorLog.Add(account.Name, summary, Detail(account, ex, failures, delay));
         _backoff[account.Name] = (DateTimeOffset.UtcNow + delay, failures, cause);
@@ -530,8 +576,61 @@ public sealed class UsageClient : IDisposable
         HttpRequestException { StatusCode: { } code } => $"HTTP {(int)code}",
         HttpRequestException or TaskCanceledException => "Offline",
         FileNotFoundException => "Not signed in",
+        SignedOutException => "Sign in again with the CLI",
         _ => ex.Message,
     };
+
+    /// <summary>
+    /// A usage response (or the CLI's / our saved copy of one) → the account's windows. The <c>limits</c> list is the
+    /// source of truth: <c>session</c> (the 5h window, missing on accounts that no longer have one), <c>weekly_all</c> and a
+    /// <c>weekly_scoped</c> per model limit. Copies from before that list existed only have five_hour / seven_day.
+    /// </summary>
+    static AccountUsage FromUtilization(string name, string plan, JsonElement u, DateTimeOffset fetchedAt, string source)
+    {
+        if (!u.TryGetProperty("limits", out var limits) || limits.ValueKind != JsonValueKind.Array)
+            return new AccountUsage(name, plan, Window(u, "five_hour"), Window(u, "seven_day"), null, fetchedAt, Source: source);
+        LimitWindow? session = null, weekly = null;
+        var models = new List<ModelLimit>();
+        var modelAt = new Dictionary<int, int>();   // index in limits → index in models, for weekly_scoped_shares
+        int index = -1;
+        foreach (var l in limits.EnumerateArray())
+        {
+            index++;
+            if (l.ValueKind != JsonValueKind.Object) continue;
+            var w = new LimitWindow(Number(l, "percent") ?? 0, Str(l, "resets_at") is { } r && DateTimeOffset.TryParse(r, out var at) ? at : null);
+            switch (Str(l, "kind"))
+            {
+                case "session": session = w; break;
+                case "weekly_all": weekly = w; break;
+                case "weekly_scoped" when ScopeName(l) is { } model:
+                    modelAt[index] = models.Count;
+                    models.Add(new ModelLimit(model, w));
+                    break;
+            }
+        }
+        // Each scoped limit's slice of the whole week: what the stacked weekly bar shows.
+        if (u.TryGetProperty("weekly_scoped_shares", out var shares) && shares.ValueKind == JsonValueKind.Array)
+            foreach (var s in shares.EnumerateArray())
+                if (s.ValueKind == JsonValueKind.Object && Number(s, "limit_index") is { } li && modelAt.TryGetValue((int)li, out int m))
+                    models[m] = models[m] with { OfWeek = Number(s, "used_percent_of_weekly"), AllowanceOfWeek = Number(s, "allowance_percent_of_weekly") };
+        return new AccountUsage(name, plan, session, weekly, null, fetchedAt, Source: source, Models: models);
+    }
+
+    static double? Number(JsonElement obj, string key)
+        => obj.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
+
+    /// <summary>What a scoped limit applies to: the model's display name ("Fable"), else its id, else the surface.</summary>
+    static string? ScopeName(JsonElement limit)
+    {
+        if (!limit.TryGetProperty("scope", out var scope) || scope.ValueKind != JsonValueKind.Object) return null;
+        if (scope.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.Object && (Str(m, "display_name") ?? Str(m, "id")) is { } model)
+            return model;
+        if (!scope.TryGetProperty("surface", out var s)) return null;
+        return s.ValueKind == JsonValueKind.String ? s.GetString() : s.ValueKind == JsonValueKind.Object ? Str(s, "display_name") : null;
+    }
+
+    static string? Str(JsonElement obj, string key)
+        => obj.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String && v.GetString() is { Length: > 0 } s ? s : null;
 
     static LimitWindow? Window(JsonElement root, string key)
     {
@@ -562,6 +661,8 @@ public sealed class UsageClient : IDisposable
         JsonNode creds = ReadCreds(account);
         if (!force && !IsExpired(creds)) return creds;
         JsonNode oauth = creds["claudeAiOauth"] ?? throw new InvalidDataException("no claudeAiOauth");
+        // The CLI drops the refresh token when it signs an account out; the token endpoint would only answer 400.
+        if (string.IsNullOrEmpty((string?)oauth["refreshToken"])) throw new SignedOutException();
         string body = new JsonObject
         {
             ["grant_type"] = "refresh_token",
@@ -609,6 +710,9 @@ public sealed class UsageClient : IDisposable
 
     /// <summary>A non-success HTTP response with what's needed to diagnose it: the request, Retry-After, the rate-limit and
     /// request-id headers and the (truncated) body. Never the Authorization header or a token.</summary>
+    /// <summary>The credentials have an expired access token and no refresh token: only a new sign-in helps.</summary>
+    public sealed class SignedOutException() : Exception("The access token has expired and the CLI holds no refresh token: run the alias and /login.");
+
     public sealed class ApiException(string method, string url, HttpStatusCode status, TimeSpan? retryAfter,
         IReadOnlyList<(string, string)> headers, string body)
         : HttpRequestException($"{method} {new Uri(url).AbsolutePath} → {(int)status} {status}", null, status)
@@ -686,15 +790,23 @@ public static class ErrorLog
     /// <summary>One line per HTTP call (time, account, method, URL, status) to <c>requests.log</c>: the call cadence that
     /// decides whether the endpoint rate-limits. Rolls over like the error log.</summary>
     public static void Request(string account, string method, string url, System.Net.HttpStatusCode status)
+        => Append(RequestsPath, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss} {account,-12} {method,-4} {url} -> {(int)status}");
+
+    public static readonly string EnginePath = Path.Combine(Dir, "engine.log");
+
+    /// <summary>FluentGpu's always-on evidence lines (<c>[device-lost]</c>, <c>[d3d12.adapter]</c> …) — the engine writes
+    /// them to stderr, which a windowed app throws away. Installed as <c>Diag.Sink</c>; called from the render thread too.</summary>
+    public static void Engine(string line) => Append(EnginePath, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff} {line}");
+
+    static void Append(string path, string line)
     {
         lock (Gate)
         {
             try
             {
                 Directory.CreateDirectory(Dir);
-                if (File.Exists(RequestsPath) && new FileInfo(RequestsPath).Length > MaxBytes) File.Move(RequestsPath, RequestsPath + ".1", overwrite: true);
-                File.AppendAllText(RequestsPath, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss} {account,-12} {method,-4} {url} -> {(int)status}{Environment.NewLine}",
-                    new UTF8Encoding(false));
+                if (File.Exists(path) && new FileInfo(path).Length > MaxBytes) File.Move(path, path + ".1", overwrite: true);
+                File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }

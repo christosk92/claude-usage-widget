@@ -1,9 +1,11 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using ClaudeUsageWidget;
 using ClaudeUsageWidget.Usage;
 using FluentGpu;
+using FluentGpu.Animation;
 using FluentGpu.Controls;
 using FluentGpu.Dsl;
 using FluentGpu.Foundation;
@@ -22,6 +24,7 @@ if (!first)
     return;
 }
 Widget.ShowRequests = showRequests;
+Diag.Sink = ErrorLog.Engine;   // the engine's device-lost / adapter evidence, otherwise lost on a windowed app's stderr
 
 FluentApp.Run(() => new OverlayHost { Child = Embed.Comp(() => new Widget()) }, new AppOptions
 {
@@ -55,6 +58,15 @@ namespace ClaudeUsageWidget
         public static bool Topmost { get => Store.GetBool("topmost", true); set => Store.SetBool("topmost", value); }
         public static bool Acrylic { get => Store.GetBool("acrylic", false); set => Store.SetBool("acrylic", value); }
         public static int PollMinutes { get => Math.Clamp(Store.GetInt("pollMinutes", 5), 1, 60); set => Store.SetInt("pollMinutes", value); }
+
+        /// <summary>Accounts whose weekly bar is expanded into its model limits (Fable …).</summary>
+        public static ImmutableHashSet<string> Expanded { get => GetNames("expanded"); set => SetNames("expanded", value); }
+
+        /// <summary>Accounts collapsed to their one-line summary.</summary>
+        public static ImmutableHashSet<string> Collapsed { get => GetNames("collapsed"); set => SetNames("collapsed", value); }
+
+        static ImmutableHashSet<string> GetNames(string key) => [.. (Store.GetString(key) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)];
+        static void SetNames(string key, ImmutableHashSet<string> names) => Store.SetString(key, string.Join(',', names.Order(StringComparer.Ordinal)));
 
         /// <summary>The outer window origin (physical px) the user last left it at; null before the first move.</summary>
         public static (int X, int Y)? Position
@@ -105,6 +117,8 @@ namespace ClaudeUsageWidget
             var layout = UseSignal(Settings.Layout);
             var topmost = UseSignal(Settings.Topmost);
             var acrylic = UseSignal(Settings.Acrylic);
+            var expanded = UseSignal(Settings.Expanded);
+            var collapsed = UseSignal(Settings.Collapsed);
             var (now, setNow) = UseState(DateTimeOffset.Now);
             var post = UseContext(HostDispatch.Post);
 
@@ -115,11 +129,13 @@ namespace ClaudeUsageWidget
                 _tray = CreateTray(usage.Refresh);
                 // A second launch signals this one: show the widget (it may be hidden to the tray).
                 var showWait = ShowRequests is { } ev
-                    ? ThreadPool.RegisterWaitForSingleObject(ev, (_, _) => post?.Invoke(() => FluentApp.SetWindowVisible(true)), null, -1, executeOnlyOnce: false)
+                    ? ThreadPool.RegisterWaitForSingleObject(ev, (_, _) => post?.Invoke(Show), null, -1, executeOnlyOnce: false)
                     : null;
                 return () => { showWait?.Unregister(null); _tray?.Dispose(); _tray = null; };
             }, DepKey.Empty);
             UseInterval(() => { setNow(DateTimeOffset.Now); SavePosition(); }, 30_000f);
+            // An unplugged monitor can leave the window where no screen is; the engine doesn't move it back.
+            UseInterval(EnsureOnScreen, 2_000f);
 
             IReadOnlyList<AccountUsage> data = usage.Loadable.Value.Value;
             bool fetching = usage.IsFetching.Value;
@@ -134,6 +150,7 @@ namespace ClaudeUsageWidget
                 new MenuFlyoutItem("Refresh now", Icons.Refresh, Invoke: usage.Refresh),
                 new MenuFlyoutItem("Manage accounts…", Icons.Contact, Invoke: () => managing.Value = true),
                 new MenuFlyoutItem("Errors…", Icons.Important, Invoke: () => errorsFor.Value = ""),
+                .. CollapseAll(),
                 MenuFlyoutItem.SubMenu("Layout",
                 [
                     MenuFlyoutItem.RadioItem("Compact", current == WidgetLayout.Compact, () => Pick(WidgetLayout.Compact)),
@@ -159,6 +176,15 @@ namespace ClaudeUsageWidget
 
             void Pick(WidgetLayout l) { layout.Value = l; Settings.Layout = l; }
 
+            // Only the layouts with a section per account collapse.
+            IEnumerable<MenuFlyoutItem> CollapseAll()
+            {
+                if (current is not (WidgetLayout.Compact or WidgetLayout.Detailed)) yield break;
+                yield return data.All(u => collapsed.Peek().Contains(u.Name))
+                    ? new MenuFlyoutItem("Expand all accounts", Icons.ChevronDown, Invoke: () => SetCollapsed([]))
+                    : new MenuFlyoutItem("Collapse all accounts", Icons.ChevronUp, Invoke: () => SetCollapsed([.. data.Select(u => u.Name)]));
+            }
+
             void ReloadAccounts()
             {
                 _accounts = AccountStore.Discover();
@@ -183,7 +209,15 @@ namespace ClaudeUsageWidget
                 Fetching: fetching,
                 Now: now,
                 PollMinutes: Settings.PollMinutes,
-                ShowErrors: name => errorsFor.Value = name);
+                ShowErrors: name => errorsFor.Value = name,
+                Expanded: expanded.Value,
+                ToggleExpanded: name => SetExpanded(Toggle(expanded.Peek(), name)),
+                Collapsed: collapsed.Value,
+                ToggleCollapsed: name => SetCollapsed(Toggle(collapsed.Peek(), name)));
+
+            static ImmutableHashSet<string> Toggle(ImmutableHashSet<string> set, string name) => set.Contains(name) ? set.Remove(name) : set.Add(name);
+            void SetExpanded(ImmutableHashSet<string> set) { expanded.Value = set; Settings.Expanded = set; }
+            void SetCollapsed(ImmutableHashSet<string> set) { collapsed.Value = set; Settings.Collapsed = set; }
 
             BoxEl body = current switch
             {
@@ -203,7 +237,7 @@ namespace ClaudeUsageWidget
             tray.SetIconSource(r => TrayIconArt.Glyph(r, TrayGlyph, badge: _badge, badgeFill: _badge is null ? null : _badgeFill));
             tray.Activated += (e, x, y) =>
             {
-                if (e is NotifyIconEvent.Select or NotifyIconEvent.KeySelect) FluentApp.SetWindowVisible(!FluentApp.WindowVisible);
+                if (e is NotifyIconEvent.Select or NotifyIconEvent.KeySelect) ToggleVisible();
                 else if (e == NotifyIconEvent.ContextMenu) TrayMenu(tray, x, y, refresh);
             };
             tray.Show();
@@ -222,7 +256,7 @@ namespace ClaudeUsageWidget
             ];
             switch (tray.ShowMenu(items, x, y))
             {
-                case 1: FluentApp.SetWindowVisible(!shown); break;
+                case 1: ToggleVisible(); break;
                 case 2: refresh(); break;
                 case 3: Exit(); break;
             }
@@ -264,14 +298,49 @@ namespace ClaudeUsageWidget
                 FluentApp.MoveWindowPx(p.X, p.Y);
         }
 
-        const uint MonitorDefaultToNull = 0;
+        /// <summary>Shown from the tray or by a second launch: also back on a screen, so showing it is always a way out.</summary>
+        static void Show() { FluentApp.SetWindowVisible(true); EnsureOnScreen(); }
+
+        static void ToggleVisible() { if (FluentApp.WindowVisible) FluentApp.SetWindowVisible(false); else Show(); }
+
+        /// <summary>
+        /// Puts the window back on a screen when its title band (the drag area, the same probe points as
+        /// <see cref="RestorePosition"/>) is on none — the monitor it sat on was unplugged and Windows left it there:
+        /// clamped into the nearest monitor's work area, so it lands on the edge closest to where it was.
+        /// </summary>
+        static void EnsureOnScreen()
+        {
+            RectF b = FluentApp.WindowBoundsPx;
+            if (b.W <= 0 || !FluentApp.WindowVisible) return;
+            int left = (int)b.X, top = (int)b.Y, right = (int)(b.X + b.W), bottom = (int)(b.Y + b.H);
+            if (MonitorFromPoint(new POINT { X = left + 40, Y = top + 20 }, MonitorDefaultToNull) != 0
+                || MonitorFromPoint(new POINT { X = right - 40, Y = top + 20 }, MonitorDefaultToNull) != 0)
+                return;
+            var rect = new RECT { Left = left, Top = top, Right = right, Bottom = bottom };
+            var info = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
+            nint monitor = MonitorFromRect(ref rect, MonitorDefaultToNearest);
+            if (monitor == 0 || !GetMonitorInfoW(monitor, ref info)) return;
+            RECT work = info.Work;
+            FluentApp.MoveWindowPx(
+                Math.Clamp(left, work.Left, Math.Max(work.Left, work.Right - (int)b.W)),
+                Math.Clamp(top, work.Top, Math.Max(work.Top, work.Bottom - (int)b.H)));
+            SavePosition();
+        }
+
+        const uint MonitorDefaultToNull = 0, MonitorDefaultToNearest = 2;
         [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Monitor, Work; public uint Flags; }
         [LibraryImport("user32.dll")] private static partial nint MonitorFromPoint(POINT pt, uint flags);
+        [LibraryImport("user32.dll")] private static partial nint MonitorFromRect(ref RECT rect, uint flags);
+        [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static partial bool GetMonitorInfoW(nint monitor, ref MONITORINFO info);
 
         // ── Layouts ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-        /// <summary>What every layout needs from the widget: the header buttons, the clock, and opening an account's errors.</summary>
-        sealed record Chrome(BoxEl Buttons, bool Fetching, DateTimeOffset Now, int PollMinutes, Action<string> ShowErrors);
+        /// <summary>What every layout needs from the widget: the header buttons, the clock, opening an account's errors, and
+        /// which accounts show their model limits under the weekly bar.</summary>
+        sealed record Chrome(BoxEl Buttons, bool Fetching, DateTimeOffset Now, int PollMinutes, Action<string> ShowErrors,
+            ImmutableHashSet<string> Expanded, Action<string> ToggleExpanded, ImmutableHashSet<string> Collapsed, Action<string> ToggleCollapsed);
 
         /// <summary>
         /// The four pickable layouts (the design canvas: A compact card, B rings, C strip, D detailed). WinUI language throughout:
@@ -286,8 +355,41 @@ namespace ClaudeUsageWidget
             public static AccountUsage? BestPick(IReadOnlyList<AccountUsage> usage)
             {
                 AccountUsage? best = null;
-                foreach (var u in usage) if (u.Session is not null && (best is null || u.Headroom > best.Headroom)) best = u;
+                foreach (var u in usage) if (u.HasData && (best is null || u.Headroom > best.Headroom)) best = u;
                 return best;
+            }
+
+            /// <summary>One bar as the layouts draw it. The week carries the model limits (Fable): their slice of the week is
+            /// stacked into its bar and clicking it expands them into rows of their own (<see cref="IsModel"/>).</summary>
+            public sealed record Row(string Label, LimitWindow? Window, IReadOnlyList<ModelLimit> Models, bool IsModel = false)
+            {
+                public bool Expandable => Models.Count > 0;
+
+                /// <summary>The models' combined use as percent of the week, or null when the endpoint gave no shares.</summary>
+                public double? ModelShare
+                {
+                    get
+                    {
+                        double? sum = null;
+                        foreach (var m in Models) if (m.OfWeek is { } of) sum = (sum ?? 0) + of;
+                        return sum;
+                    }
+                }
+            }
+
+            /// <summary>
+            /// The bars to show for an account: the 5h session (unless the account has data but no 5h window), the
+            /// all-models week with its model limits stacked in, and — expanded — each model's weekly limit under its name.
+            /// </summary>
+            public static List<Row> Rows(AccountUsage u, string session, string weekly, bool expanded)
+            {
+                var rows = new List<Row>(4);
+                if (u.Session is not null || !u.HasData) rows.Add(new Row(session, u.Session, []));
+                var models = u.Models ?? [];
+                rows.Add(new Row(weekly, u.Weekly, models));
+                if (expanded)
+                    foreach (var m in models) rows.Add(new Row(m.Name, m.Window, [], IsModel: true));
+                return rows;
             }
 
             /// <summary>Headroom (percent left) → the WinUI status fill: critical under 10, caution under 25, success otherwise.</summary>
@@ -302,16 +404,9 @@ namespace ClaudeUsageWidget
                 for (int i = 0; i < usage.Count; i++)
                 {
                     var u = usage[i];
-                    rows[i] = new BoxEl
-                    {
-                        Direction = 1, Gap = 6,
-                        Children =
-                        [
-                            AccountLine(u, 14f, c.ShowErrors),
-                            Bar("5h", u.Session, 156f, 20f, c.Now),
-                            Bar("7d", u.Weekly, 156f, 20f, c.Now),
-                        ],
-                    };
+                    var lines = new List<Element> { AccountLine(u, 14f, c, collapsible: true) };
+                    if (!c.Collapsed.Contains(u.Name)) lines.Add(BarsSection(u, c, "5h", "7d", 136f, 20f));
+                    rows[i] = new BoxEl { Direction = 1, Children = [.. lines] };
                 }
                 return Page(Header("Claude Code usage", c), new BoxEl { Direction = 1, Gap = 8, Padding = new Edges4(14, 0, 14, 8), Children = rows });
             }
@@ -324,27 +419,30 @@ namespace ClaudeUsageWidget
                 for (int i = 0; i < usage.Count; i++)
                 {
                     var u = usage[i];
-                    float s = (float)(u.Session?.Percent ?? 0) / 100f, w = (float)(u.Weekly?.Percent ?? 0) / 100f;
-                    cols[i] = new BoxEl
+                    // Outer ring the first window (5h, or the week when there's no 5h), inner ring the second.
+                    var rows = Rows(u, "5h", "7d", c.Expanded.Contains(u.Name));
+                    Row outer = rows[0];
+                    Row? inner = rows.Count > 1 && !rows[1].IsModel ? rows[1] : null;
+                    var lines = new List<Element>
                     {
-                        Direction = 1, Width = 128, Gap = 6, AlignItems = FlexAlign.Center,
-                        Children =
-                        [
-                            new BoxEl
-                            {
-                                ZStack = true, Width = 96, Height = 96,
-                                Children =
-                                [
-                                    ProgressRing.Determinate(s, 96f, foreground: Severity(u.Session), track: Tok.FillControlSecondary),
-                                    Centered(96, ProgressRing.Determinate(w, 64f, foreground: Severity(u.Weekly), track: Tok.FillControlSecondary)),
-                                    Centered(96, new TextEl(Pct(u.Session)) { Size = 14f, Weight = 600, Color = Tok.TextPrimary }),
-                                ],
-                            },
-                            AccountLine(u, 13f, c.ShowErrors, center: true),
-                            new TextEl(WindowLine("5h", u.Session, c.Now)) { Size = 12f, Color = Tok.TextSecondary },
-                            new TextEl(WindowLine("7d", u.Weekly, c.Now)) { Size = 12f, Color = Tok.TextSecondary },
-                        ],
+                        new BoxEl
+                        {
+                            ZStack = true, Width = 96, Height = 96,
+                            Children =
+                            [
+                                Ring(outer, 96f),
+                                Centered(96, inner is null ? new BoxEl() : Ring(inner, 64f)),
+                                Centered(96, new TextEl(Pct(outer.Window)) { Size = 14f, Weight = 600, Color = Tok.TextPrimary }),
+                            ],
+                        },
+                        AccountLine(u, 13f, c, center: true),
                     };
+                    foreach (var row in rows)
+                    {
+                        var text = new TextEl(WindowLine(row.Label, row.Window, c.Now)) { Size = 12f, Color = row.IsModel ? Tok.TextTertiary : Tok.TextSecondary };
+                        lines.Add(row.Expandable ? Expander(u, row, text, c) : text);
+                    }
+                    cols[i] = new BoxEl { Direction = 1, Width = 128, Gap = 6, AlignItems = FlexAlign.Center, Children = [.. lines] };
                 }
                 return Page(Header("Claude Code usage", c),
                     new BoxEl { Direction = 0, Gap = 8, Padding = new Edges4(12, 4, 12, 12), Justify = FlexJustify.Center, Children = cols });
@@ -366,6 +464,15 @@ namespace ClaudeUsageWidget
                 for (int i = 0; i < usage.Count; i++)
                 {
                     var u = usage[i];
+                    var rows = Rows(u, "5h", "7d", c.Expanded.Contains(u.Name));
+                    var bars = new Element[rows.Count];
+                    var nums = new string[rows.Count];
+                    for (int k = 0; k < rows.Count; k++)
+                    {
+                        bars[k] = StackedBar(rows[k], 56f);
+                        nums[k] = Num(rows[k].Window);
+                    }
+                    var barColumn = new BoxEl { Direction = 1, Gap = 4, Children = bars };
                     if (i > 0) items.Add(new BoxEl { Width = 1, Height = 24, Fill = Tok.StrokeDividerDefault, Margin = new Edges4(12, 0, 12, 0) });
                     items.Add(new BoxEl
                     {
@@ -373,14 +480,10 @@ namespace ClaudeUsageWidget
                         Children =
                         [
                             new TextEl(u.Name) { Size = 12f, Weight = 600, Color = Tok.TextPrimary, Width = 56, Trim = TextTrim.CharacterEllipsis, MaxLines = 1 },
-                            new BoxEl
-                            {
-                                Direction = 1, Gap = 4,
-                                Children = [ProgressBar.Determinate(Frac(u.Session), 56f, State(u.Session)), ProgressBar.Determinate(Frac(u.Weekly), 56f, State(u.Weekly))],
-                            },
-                            u.Error is { } e && u.Session is null
+                            rows.Find(r => r.Expandable) is { } week ? Expander(u, week, barColumn, c) : barColumn,
+                            u.Error is { } e && !u.HasData
                                 ? ErrorText(u, e, c.ShowErrors) with { Shrink = 1f, MinWidth = 0f }
-                                : new TextEl($"{Num(u.Session)} · {Num(u.Weekly)}")
+                                : new TextEl(string.Join(" · ", nums))
                                   { Size = 12f, Color = Tok.TextSecondary, Trim = TextTrim.CharacterEllipsis, MaxLines = 1, Shrink = 1f, MinWidth = 0f },
                         ],
                     });
@@ -401,15 +504,16 @@ namespace ClaudeUsageWidget
                     Card(new Edges4(14, 10, 14, 10), 2,
                         new TextEl("Best pick now") { Size = 12f, Weight = 600, Color = Tok.AccentTextPrimary },
                         new TextEl(best is null ? "Waiting for data…" : "claude-" + best.Name) { Size = 16f, Weight = 600, LineHeight = 22f, Color = Tok.TextPrimary },
-                        new TextEl(best is null ? " " : $"{100 - best.Session!.Percent:0}% of the 5h window and {100 - (best.Weekly?.Percent ?? 0):0}% of the week left")
+                        new TextEl(best is null ? " "
+                            : best.Session is { } s ? $"{100 - s.Percent:0}% of the 5h window and {100 - (best.Weekly?.Percent ?? 0):0}% of the week left"
+                            : $"{100 - (best.Weekly?.Percent ?? 0):0}% of the week left")
                         { Size = 12f, Color = Tok.TextSecondary }),
                 };
                 foreach (var u in usage)
                 {
-                    children.Add(Card(new Edges4(14, 10, 14, 12), 6,
-                        AccountLine(u, 14f, c.ShowErrors),
-                        Bar("Session", u.Session, 112f, 52f, c.Now),
-                        Bar("Weekly", u.Weekly, 112f, 52f, c.Now)));
+                    var lines = new List<Element> { AccountLine(u, 14f, c, collapsible: true) };
+                    if (!c.Collapsed.Contains(u.Name)) lines.Add(BarsSection(u, c, "Session", "Weekly", 96f, 52f));
+                    children.Add(Card(new Edges4(14, 10, 14, 10), 0, [.. lines]));
                 }
                 DateTimeOffset fetched = usage.Count > 0 ? usage[0].FetchedAt : c.Now;
                 children.Add(new TextEl(c.Fetching ? "Updating…" : $"Updated {Ago(c.Now - fetched)} · every {c.PollMinutes} min")
@@ -440,32 +544,141 @@ namespace ClaudeUsageWidget
                 Fill = Tok.FillCardDefault, BorderColor = Tok.StrokeCardDefault, BorderWidth = 1f, Children = children,
             };
 
-            /// <summary>"ohsnap  MAX" — the alias name, its plan as a WinUI-style tag, and the account's error if it has one.</summary>
-            static BoxEl AccountLine(AccountUsage u, float size, Action<string> showErrors, bool center = false)
+            // ── disclosure motion (Wavee's Design.Reveal; fluent-gpu docs/plans/smooth-reveal-implementation.md) ─────────────
+
+            /// <summary>Wavee's <c>Design.Reveal.Drawer</c>: a section that mounts to open and unmounts to close. Layout lands
+            /// once, the presented height springs under <c>MotionTok.Reveal</c> (critically damped, the same both ways,
+            /// interruptible from where it stands) and everything below — the next rows, the next accounts — rides it at
+            /// paint time. A clip reveal, never a fade: nothing pops and nothing re-lays out per frame.</summary>
+            static readonly LayoutTransition Unfold = new(TransitionChannels.Size, MotionTok.Reveal.ToDynamics(),
+                Size: SizeMode.FlowReveal, Enter: new EnterExit(Active: true), Exit: new EnterExit(Active: true),
+                Anchor: SizeAnchor.Leading, SuppressDescendantTransitions: true);
+
+            /// <summary>The folded line's summary: in from 8 DIP to the right, out in place, on the reveal's spring.</summary>
+            static readonly LayoutTransition FadeIn = new(TransitionChannels.Opacity, MotionTok.Reveal.ToDynamics(),
+                Enter: new EnterExit(Dx: 8f, Opacity: 0f, Active: true), Exit: new EnterExit(Opacity: 0f, Active: true));
+
+            /// <summary>An account's bars as one <see cref="Drawer"/> (Compact, Detailed): the 5h and week rows, then the model
+            /// rows in a drawer of their own under the week.</summary>
+            static BoxEl BarsSection(AccountUsage u, Chrome c, string session, string weekly, float barWidth, float labelWidth)
             {
-                var parts = new List<Element>(3)
-                {
-                    new TextEl(u.Name) { Size = size, Weight = 600, Color = Tok.TextPrimary },
-                };
+                var rows = new List<Element>(3);
+                foreach (var r in Rows(u, session, weekly, expanded: false)) rows.Add(Spaced(Bar(u, r, barWidth, labelWidth, c)));
+                if (c.Expanded.Contains(u.Name) && u.Models is { Count: > 0 } models)
+                    rows.Add(Drawer("models:" + u.Name, [.. models.Select(m => Spaced(Bar(u, new Row(m.Name, m.Window, [], IsModel: true), barWidth, labelWidth, c)))]));
+                return Drawer("bars:" + u.Name, [.. rows]);
+            }
+
+            /// <summary>A row with its gap above it as its own padding, so a row that folds away takes its gap along.</summary>
+            static BoxEl Spaced(Element row) => new() { Direction = 1, Padding = new Edges4(0, 6, 0, 0), Children = [row] };
+
+            /// <summary>A mount-to-open section on <see cref="Unfold"/>. It clips while it moves, so it pads out by the rows'
+            /// hover plates (<see cref="Clickable"/> overhangs 4 / 1 DIP) and takes the room back with a negative margin.</summary>
+            static BoxEl Drawer(string key, Element[] children) => new()
+            {
+                Key = key, Direction = 1, ClipToBounds = true, Animate = Unfold,
+                Padding = new Edges4(4, 0, 4, 1), Margin = new Edges4(-4, 0, -4, -1),
+                Children = children,
+            };
+
+            /// <summary>One chevron glyph, turned to <paramref name="rotation"/> on the reveal's spring (Expander's chevron).</summary>
+            static BoxEl Chevron(float rotation) => new()
+            {
+                Width = 10, Height = 10, AlignItems = FlexAlign.Center, Justify = FlexJustify.Center,
+                Rotation = rotation, Transition = MotionTok.Reveal,
+                Children = [Ui.Icon(Icons.ChevronDown) with { Size = 10f, Color = Tok.TextTertiary }],
+            };
+
+            /// <summary>
+            /// "ohsnap  ULTRA" — the alias name, its plan as a WinUI-style tag, and the account's error if it has one.
+            /// <paramref name="collapsible"/> (Compact, Detailed): a chevron, and clicking the title folds the account to this
+            /// one line, which then ends in its <see cref="Summary"/> (the error only while there are no numbers to show).
+            /// </summary>
+            static BoxEl AccountLine(AccountUsage u, float size, Chrome c, bool center = false, bool collapsible = false)
+            {
+                bool folded = collapsible && c.Collapsed.Contains(u.Name);
+                var title = new List<Element>(3);
+                if (collapsible) title.Add(Chevron(folded ? -90f : 0f));
+                title.Add(new TextEl(u.Name) { Size = size, Weight = 600, Color = Tok.TextPrimary });
                 if (u.Plan.Length > 0)
                 {
-                    parts.Add(new BoxEl
+                    title.Add(new BoxEl
                     {
                         Padding = new Edges4(6, 1, 6, 1), Corners = Radii.ControlAll, Fill = Tok.FillControlSecondary,
                         BorderColor = Tok.StrokeControlDefault, BorderWidth = 1f,
                         Children = [new TextEl(u.Plan.ToUpperInvariant()) { Size = 10f, Weight = 600, Color = Tok.TextSecondary }],
                     });
                 }
-                if (u.Error is { } err && !center)
+                var parts = new List<Element>(4);
+                if (collapsible)
+                {
+                    var titleRow = new BoxEl { Direction = 0, Gap = 8, AlignItems = FlexAlign.Center, Children = [.. title] };
+                    parts.Add(Clickable(titleRow, () => c.ToggleCollapsed(u.Name), folded ? "Show the bars" : "Fold to one line"));
+                }
+                else parts.AddRange(title);
+                if (folded && u.HasData)
                 {
                     parts.Add(new BoxEl { Grow = 1f });
-                    parts.Add(ErrorText(u, err, showErrors));
+                    var glance = new List<Element>(2);
+                    if (u.Failure is not null)
+                        glance.Add(Clickable(Ui.Icon(Icons.Important) with { Size = 12f, Color = Tok.SystemFillCritical }, () => c.ShowErrors(u.Name), u.Error));
+                    glance.Add(Summary(u, c));
+                    // Fades in from the right as the bars fold away under it, and out again as they unfold.
+                    parts.Add(new BoxEl { Key = "glance:" + u.Name, Direction = 0, Gap = 8, AlignItems = FlexAlign.Center, Animate = FadeIn, Children = [.. glance] });
+                }
+                else if (u.Error is { } err && !center)
+                {
+                    parts.Add(new BoxEl { Grow = 1f });
+                    parts.Add(ErrorText(u, err, c.ShowErrors));
                 }
                 return new BoxEl
                 {
                     Direction = 0, Gap = 8, AlignItems = FlexAlign.Center, Justify = center ? FlexJustify.Center : FlexJustify.Start,
                     Children = [.. parts],
                 };
+            }
+
+            /// <summary>
+            /// A folded account at a glance: its bars in miniature (5h over the week, Fable's slice stacked in) and what's
+            /// left as a status pill — green / amber / red like the tray badge — with every number in the tooltip.
+            /// </summary>
+            static Element Summary(AccountUsage u, Chrome c)
+            {
+                var rows = Rows(u, "5h", "7d", expanded: false);
+                var bars = new Element[rows.Count];
+                for (int i = 0; i < rows.Count; i++) bars[i] = StackedBar(rows[i], 56f);
+
+                double left = Math.Max(0, u.Headroom);
+                ColorF tone = HeadroomColor(left);
+                var pill = new BoxEl
+                {
+                    Width = 64, Padding = new Edges4(0, 1, 0, 2), Corners = Radii.ControlAll, Justify = FlexJustify.Center,
+                    Fill = tone with { A = tone.A * 0.16f }, BorderColor = tone with { A = tone.A * 0.35f }, BorderWidth = 1f,
+                    Children = [new TextEl($"{left:0}% left") { Size = 11f, Weight = 600, Color = tone, FontFeatures = FontFeatures.TabularFigures }],
+                };
+
+                var tip = new List<string>(rows.Count + 2);
+                foreach (var r in rows) tip.Add(WindowLine(r.Label, r.Window, c.Now));
+                foreach (var m in u.Models ?? [])
+                    tip.Add($"{m.Name} {m.Window.Percent:0}% of its limit{(m.OfWeek is { } of ? $" · {of:0}% of the week" : "")}");
+                return ToolTip.Wrap(new BoxEl
+                {
+                    Direction = 0, Gap = 10, AlignItems = FlexAlign.Center,
+                    Children = [new BoxEl { Direction = 1, Gap = 3, Children = bars }, pill],
+                }, string.Join("\n", tip));
+            }
+
+            /// <summary>A subtle button around <paramref name="content"/> (hover / pressed fill, hand cursor), with a tooltip.</summary>
+            static Element Clickable(Element content, Action onClick, string? tip)
+            {
+                var button = new BoxEl
+                {
+                    Padding = new Edges4(4, 1, 4, 1), Margin = new Edges4(-4, -1, -4, -1), Corners = Radii.ControlAll,
+                    Fill = Tok.FillSubtleTransparent, HoverFill = Tok.FillSubtleSecondary, PressedFill = Tok.FillSubtleTertiary,
+                    Cursor = CursorId.Hand, Focusable = true, Role = AutomationRole.Button, OnClick = onClick,
+                    Children = [content],
+                }.NoWindowDrag();
+                return tip is { Length: > 0 } ? ToolTip.Wrap(button, tip) : button;
             }
 
             /// <summary>
@@ -485,18 +698,107 @@ namespace ClaudeUsageWidget
                 }.NoWindowDrag();
             }
 
-            /// <summary>label · bar · percent · reset — one limit window.</summary>
-            static BoxEl Bar(string label, LimitWindow? w, float barWidth, float labelWidth, DateTimeOffset now) => new()
+            /// <summary>label · bar · percent · reset · chevron — one limit window. The week's row expands / collapses its
+            /// model rows; a model row is indented under it with a swatch of its slice's colour.</summary>
+            /// <summary>Room for a model row's swatch + name ("■ Fable").</summary>
+            const float ModelLabelWidth = 44f;
+
+            static Element Bar(AccountUsage u, Row r, float barWidth, float labelWidth, Chrome c)
             {
-                Direction = 0, Gap = 8, AlignItems = FlexAlign.Center,
-                Children =
-                [
-                    new TextEl(label) { Size = 12f, Color = Tok.TextSecondary, Width = labelWidth },
-                    ProgressBar.Determinate(Frac(w), barWidth, State(w)),
-                    new TextEl(Pct(w)) { Size = 12f, Weight = 600, Color = Tok.TextPrimary, Width = 36, TextAlign = TextAlign.End, FontFeatures = FontFeatures.TabularFigures },
-                    new TextEl(Countdown.Reset(w?.ResetsAt, now)) { Size = 12f, Color = Tok.TextSecondary, Width = 64, TextAlign = TextAlign.End, FontFeatures = FontFeatures.TabularFigures },
-                ],
-            };
+                var w = r.Window;
+                // The label column fits "5h" / "7d"; a model row's "■ Fable" takes the extra room from its own bar, so it
+                // sits indented under the week instead of every row reserving the space.
+                if (r.IsModel && labelWidth < ModelLabelWidth)
+                {
+                    barWidth -= ModelLabelWidth - labelWidth;
+                    labelWidth = ModelLabelWidth;
+                }
+                Element label = r.IsModel
+                    ? new BoxEl
+                    {
+                        Direction = 0, Gap = 5, AlignItems = FlexAlign.Center, Width = labelWidth,
+                        Children =
+                        [
+                            new BoxEl { Width = 6, Height = 6, Corners = CornerRadius4.All(1.5f), Fill = ModelTint(Severity(u.Weekly)) },
+                            new TextEl(r.Label) { Size = 12f, Color = Tok.TextSecondary, MaxLines = 1, Trim = TextTrim.CharacterEllipsis, Shrink = 1f, MinWidth = 0f },
+                        ],
+                    }
+                    : new TextEl(r.Label) { Size = 12f, Color = Tok.TextSecondary, Width = labelWidth };
+                var row = new BoxEl
+                {
+                    Direction = 0, Gap = 8, AlignItems = FlexAlign.Center,
+                    Children =
+                    [
+                        label,
+                        StackedBar(r, barWidth),
+                        new TextEl(Pct(w)) { Size = 12f, Weight = 600, Color = Tok.TextPrimary, Width = 36, TextAlign = TextAlign.End, FontFeatures = FontFeatures.TabularFigures },
+                        new TextEl(Countdown.Reset(w?.ResetsAt, c.Now)) { Size = 12f, Color = Tok.TextSecondary, Width = 64, TextAlign = TextAlign.End, FontFeatures = FontFeatures.TabularFigures },
+                        r.Expandable ? Chevron(c.Expanded.Contains(u.Name) ? 180f : 0f) with { Width = 12 } : new BoxEl { Width = 12 },
+                    ],
+                };
+                return r.Expandable ? Expander(u, r, row, c) : row;
+            }
+
+            /// <summary>
+            /// The week's bar: the fill in its status colour, the model limits' slice of the week stacked at its end in a
+            /// faded tint of that colour (1px apart). Without shares (or with nothing used on the models) a plain ProgressBar.
+            /// </summary>
+            static BoxEl StackedBar(Row r, float width)
+            {
+                if (r.ModelShare is not { } share || share <= 0 || r.Window is null) return ProgressBar.Determinate(Frac(r.Window), width, State(r.Window));
+                var st = ProgressBar.DefaultStyle;
+                ColorF fill = st.ForegroundFor(State(r.Window));
+                float total = Frac(r.Window) * width, model = Math.Min(total, (float)Math.Clamp(share / 100, 0, 1) * width), rest = total - model;
+                float gap = rest >= 1f && model >= 2f ? 1f : 0f;
+                var radius = CornerRadius4.All(st.IndicatorRadius);
+                return new BoxEl
+                {
+                    ZStack = true, Width = width, Height = st.Height, Role = AutomationRole.ProgressBar,
+                    Children =
+                    [
+                        new BoxEl { Width = width, Height = st.TrackHeight, OffsetY = (st.Height - st.TrackHeight) / 2f, Corners = CornerRadius4.All(st.TrackRadius), Fill = st.TrackFill },
+                        new BoxEl { Width = rest, Height = st.Height, Corners = radius, Fill = fill },
+                        new BoxEl { OffsetX = rest + gap, Width = model - gap, Height = st.Height, Corners = radius, Fill = ModelTint(fill) },
+                    ],
+                };
+            }
+
+            /// <summary>A ring for the Rings layout, stacked like <see cref="StackedBar"/>: the whole fill in the model tint
+            /// with the other models' part drawn solid over it from 12 o'clock.</summary>
+            static BoxEl Ring(Row r, float size)
+            {
+                ColorF fill = Severity(r.Window);
+                if (r.ModelShare is not { } share || share <= 0 || r.Window is null)
+                    return ProgressRing.Determinate(Frac(r.Window), size, foreground: fill, track: Tok.FillControlSecondary);
+                float rest = Math.Max(0f, Frac(r.Window) - (float)Math.Clamp(share / 100, 0, 1));
+                return new BoxEl
+                {
+                    ZStack = true, Width = size, Height = size,
+                    Children =
+                    [
+                        ProgressRing.Determinate(Frac(r.Window), size, foreground: ModelTint(fill), track: Tok.FillControlSecondary),
+                        ProgressRing.Determinate(rest, size, foreground: fill),
+                    ],
+                };
+            }
+
+            /// <summary>The colour of the model limits' slice: the bar's status colour, faded.</summary>
+            static ColorF ModelTint(ColorF fill) => fill with { A = fill.A * 0.45f };
+
+            /// <summary>Makes the week's row (or the strip's bars) a button that shows / hides the model rows, with a tooltip
+            /// that spells out the split: "Other models 56% · Fable 35% of the week (up to 50%)".</summary>
+            static Element Expander(AccountUsage u, Row week, Element content, Chrome c)
+            {
+                bool open = c.Expanded.Contains(u.Name);
+                var parts = new List<string>(week.Models.Count + 1);
+                if (week.ModelShare is { } share && week.Window is { } w) parts.Add($"Other models {Math.Max(0, w.Percent - share):0}%");
+                foreach (var m in week.Models)
+                    parts.Add(m.OfWeek is { } of
+                        ? $"{m.Name} {of:0}% of the week{(m.AllowanceOfWeek is { } a ? $" (up to {a:0}%)" : "")}"
+                        : $"{m.Name} {m.Window.Percent:0}% of its limit");
+                string tip = $"{string.Join(" · ", parts)}\nClick to {(open ? "hide" : "show")} {string.Join(", ", week.Models.Select(m => m.Name))}";
+                return Clickable(content, () => c.ToggleExpanded(u.Name), tip);
+            }
 
             static BoxEl Centered(float size, Element child) => new()
             {
@@ -808,10 +1110,12 @@ namespace ClaudeUsageWidget
                 sb.AppendLine("OAuth credentials in `~/.claude-<name>/.credentials.json`, refreshes an expired access token via");
                 sb.AppendLine("`POST https://platform.claude.com/v1/oauth/token` (fallback `console.anthropic.com`), then calls");
                 sb.AppendLine("`GET https://api.anthropic.com/api/oauth/usage` (header `anthropic-beta: oauth-2025-04-20`), the endpoint behind the");
-                sb.AppendLine($"CLI's `/usage`. It polls every {Settings.PollMinutes} min; a failure backs off 1, 2, 4 … 30 min (at least 2 min on 429,");
+                sb.AppendLine($"CLI's `/usage`. It polls every {Settings.PollMinutes} min; a failure backs off 1, 2, 4 … 30 min (429: 5, 10, 20, 40, 60 min;");
                 sb.AppendLine("at least the server's Retry-After) and keeps showing the last good numbers. It skips the call when it already");
                 sb.AppendLine("has numbers under 2 min old: its own (saved across restarts) or Claude Code's cached copy in");
-                sb.AppendLine("`~/.claude-<name>/.claude.json` (`cachedUsageUtilization`, stamped `fetchedAtMs`).");
+                sb.AppendLine("`~/.claude-<name>/.claude.json` (`cachedUsageUtilization`, stamped `fetchedAtMs`). The windows come from the");
+                sb.AppendLine("response's `limits` list (`session`, `weekly_all`, `weekly_scoped` per model), else `five_hour` / `seven_day`; the");
+                sb.AppendLine("plan from the CLI's cached profile (`oauthAccount.planDisplayName`), else the credentials' `subscriptionType`.");
                 sb.AppendLine();
                 sb.AppendLine($"- Generated: {now:yyyy-MM-dd HH:mm:ss zzz}");
                 sb.AppendLine($"- OS: {Environment.OSVersion.VersionString}, .NET {Environment.Version}");
@@ -819,10 +1123,13 @@ namespace ClaudeUsageWidget
                 sb.AppendLine();
                 sb.AppendLine("## Accounts");
                 sb.AppendLine();
-                sb.AppendLine("| Account | Plan | 5h window | 7d window | Status | Numbers from | Fetched |");
-                sb.AppendLine("|---|---|---|---|---|---|---|");
+                sb.AppendLine("| Account | Plan | 5h window | 7d window | Model limits | Status | Numbers from | Fetched |");
+                sb.AppendLine("|---|---|---|---|---|---|---|---|");
                 foreach (var u in usage)
-                    sb.AppendLine($"| {u.Name} | {(u.Plan.Length > 0 ? u.Plan : "–")} | {Window(u.Session, now)} | {Window(u.Weekly, now)} | {u.Error ?? "OK"} | {(u.Session is null ? "–" : u.Source)} | {(u.Session is null ? "never" : u.FetchedAt.ToString("HH:mm:ss"))} |");
+                {
+                    string models = u.Models is { Count: > 0 } ms ? string.Join(", ", ms.Select(m => $"{m.Name} {Window(m.Window, now)}")) : "–";
+                    sb.AppendLine($"| {u.Name} | {(u.Plan.Length > 0 ? u.Plan : "–")} | {(u.HasData && u.Session is null ? "none" : Window(u.Session, now))} | {Window(u.Weekly, now)} | {models} | {u.Error ?? "OK"} | {(u.HasData ? u.Source : "–")} | {(u.HasData ? u.FetchedAt.ToString("HH:mm:ss") : "never")} |");
+                }
                 sb.AppendLine();
                 var entries = ErrorLog.For(null);
                 sb.AppendLine($"## Failures ({entries.Count}, newest first)");
